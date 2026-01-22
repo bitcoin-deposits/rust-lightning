@@ -177,6 +177,22 @@ pub(crate) trait TxBuilder {
 	) -> (CommitmentTransaction, CommitmentStats)
 	where
 		L::Target: Logger;
+
+	/// Build a commitment transaction with extra outputs for both parties.
+	///
+	/// Extra outputs are subtracted from the respective party's balance before constructing the
+	/// commitment transaction. This is used by protocol extensions like Bitcoin Deposits.
+	fn build_commitment_transaction_with_extra_outputs<L: Deref>(
+		&self, local: bool, commitment_number: u64, per_commitment_point: &PublicKey,
+		channel_parameters: &ChannelTransactionParameters, secp_ctx: &Secp256k1<secp256k1::All>,
+		value_to_self_msat: u64, htlcs_in_tx: Vec<HTLCOutputInCommitment>, feerate_per_kw: u32,
+		broadcaster_dust_limit_satoshis: u64,
+		broadcaster_extra_outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+		countersignatory_extra_outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+		logger: &L,
+	) -> (CommitmentTransaction, CommitmentStats)
+	where
+		L::Target: Logger;
 }
 
 pub(crate) struct SpecTxBuilder {}
@@ -456,6 +472,158 @@ impl TxBuilder for SpecTxBuilder {
 			htlcs_in_tx,
 			&directed_parameters,
 			secp_ctx,
+		);
+
+		(
+			tx,
+			CommitmentStats {
+				commit_tx_fee_sat,
+				local_balance_before_fee_msat,
+				remote_balance_before_fee_msat,
+			},
+		)
+	}
+
+	fn build_commitment_transaction_with_extra_outputs<L: Deref>(
+		&self, local: bool, commitment_number: u64, per_commitment_point: &PublicKey,
+		channel_parameters: &ChannelTransactionParameters, secp_ctx: &Secp256k1<secp256k1::All>,
+		value_to_self_msat: u64, mut htlcs_in_tx: Vec<HTLCOutputInCommitment>, feerate_per_kw: u32,
+		broadcaster_dust_limit_satoshis: u64,
+		broadcaster_extra_outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+		countersignatory_extra_outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+		logger: &L,
+	) -> (CommitmentTransaction, CommitmentStats)
+	where
+		L::Target: Logger,
+	{
+		// Calculate extra output totals
+		let broadcaster_extra_total_sat: u64 = broadcaster_extra_outputs.iter()
+			.map(|o| o.amount_satoshis).sum();
+		let countersignatory_extra_total_sat: u64 = countersignatory_extra_outputs.iter()
+			.map(|o| o.amount_satoshis).sum();
+
+		let mut local_htlc_total_msat = 0;
+		let mut remote_htlc_total_msat = 0;
+		let channel_type = &channel_parameters.channel_type_features;
+
+		let is_dust = |offered: bool, amount_msat: u64| -> bool {
+			let htlc_tx_fee_sat = if channel_type.supports_anchors_zero_fee_htlc_tx() {
+				0
+			} else {
+				let htlc_tx_weight = if offered {
+					htlc_timeout_tx_weight(channel_type)
+				} else {
+					htlc_success_tx_weight(channel_type)
+				};
+				feerate_per_kw as u64 * htlc_tx_weight / 1000
+			};
+			amount_msat / 1000 < broadcaster_dust_limit_satoshis + htlc_tx_fee_sat
+		};
+
+		// Trim dust htlcs
+		htlcs_in_tx.retain(|htlc| {
+			if htlc.offered == local {
+				local_htlc_total_msat += htlc.amount_msat;
+			} else {
+				remote_htlc_total_msat += htlc.amount_msat;
+			}
+			if is_dust(htlc.offered, htlc.amount_msat) {
+				log_trace!(
+					logger,
+					"   ...trimming {} HTLC with value {}sat, hash {}, due to dust limit {}",
+					if htlc.offered == local { "outbound" } else { "inbound" },
+					htlc.amount_msat / 1000,
+					htlc.payment_hash,
+					broadcaster_dust_limit_satoshis
+				);
+				false
+			} else {
+				true
+			}
+		});
+
+		let commit_tx_fee_sat = self.commit_tx_fee_sat(
+			feerate_per_kw,
+			htlcs_in_tx.len(),
+			&channel_parameters.channel_type_features,
+		);
+		let value_to_self_after_htlcs_msat =
+			value_to_self_msat.checked_sub(local_htlc_total_msat).unwrap();
+		let value_to_remote_after_htlcs_msat = (channel_parameters.channel_value_satoshis * 1000)
+			.checked_sub(value_to_self_msat)
+			.unwrap()
+			.checked_sub(remote_htlc_total_msat)
+			.unwrap();
+		let (local_balance_before_fee_msat, remote_balance_before_fee_msat) = self
+			.subtract_non_htlc_outputs(
+				channel_parameters.is_outbound_from_holder,
+				value_to_self_after_htlcs_msat,
+				value_to_remote_after_htlcs_msat,
+				&channel_parameters.channel_type_features,
+			);
+
+		let (value_to_self, value_to_remote) = if channel_parameters.is_outbound_from_holder {
+			(
+				(local_balance_before_fee_msat / 1000).saturating_sub(commit_tx_fee_sat),
+				remote_balance_before_fee_msat / 1000,
+			)
+		} else {
+			(
+				local_balance_before_fee_msat / 1000,
+				(remote_balance_before_fee_msat / 1000).saturating_sub(commit_tx_fee_sat),
+			)
+		};
+
+		// Subtract extra outputs from the respective balances
+		let value_to_self_after_extra = value_to_self.saturating_sub(
+			if local { broadcaster_extra_total_sat } else { countersignatory_extra_total_sat }
+		);
+		let value_to_remote_after_extra = value_to_remote.saturating_sub(
+			if local { countersignatory_extra_total_sat } else { broadcaster_extra_total_sat }
+		);
+
+		let mut to_broadcaster_value_sat = if local { value_to_self_after_extra } else { value_to_remote_after_extra };
+		let mut to_countersignatory_value_sat = if local { value_to_remote_after_extra } else { value_to_self_after_extra };
+
+		if to_broadcaster_value_sat >= broadcaster_dust_limit_satoshis {
+			log_trace!(
+				logger,
+				"   ...including {} output with value {}",
+				if local { "to_local" } else { "to_remote" },
+				to_broadcaster_value_sat
+			);
+		} else {
+			to_broadcaster_value_sat = 0;
+		}
+
+		if to_countersignatory_value_sat >= broadcaster_dust_limit_satoshis {
+			log_trace!(
+				logger,
+				"   ...including {} output with value {}",
+				if local { "to_remote" } else { "to_local" },
+				to_countersignatory_value_sat
+			);
+		} else {
+			to_countersignatory_value_sat = 0;
+		}
+
+		let directed_parameters = if local {
+			channel_parameters.as_holder_broadcastable()
+		} else {
+			channel_parameters.as_counterparty_broadcastable()
+		};
+
+		let tx = CommitmentTransaction::new_with_extra_outputs(
+			commitment_number,
+			per_commitment_point,
+			to_broadcaster_value_sat,
+			to_countersignatory_value_sat,
+			feerate_per_kw,
+			htlcs_in_tx,
+			&directed_parameters,
+			secp_ctx,
+			broadcaster_extra_outputs,
+			countersignatory_extra_outputs,
 		);
 
 		(

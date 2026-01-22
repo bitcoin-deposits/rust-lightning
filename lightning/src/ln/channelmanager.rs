@@ -53,7 +53,7 @@ use crate::events::{
 	InboundChannelFunds, PaymentFailureReason, ReplayEvent,
 };
 use crate::events::{FundingInfo, PaidBolt12Invoice};
-use crate::ln::chan_utils::selected_commitment_sat_per_1000_weight;
+use crate::ln::chan_utils::{selected_commitment_sat_per_1000_weight, CommitmentExtraOutput};
 #[cfg(any(test, fuzzing))]
 use crate::ln::channel::QuiescentAction;
 use crate::ln::channel::{
@@ -13103,6 +13103,266 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			}),
 		};
 		Ok(initiator)
+	}
+
+	// ==================== Commitment Extra Outputs API ====================
+	//
+	// These methods provide a generic mechanism for including extra outputs in
+	// commitment transactions. External code (like deposits-ldk) handles protocol-
+	// specific logic via custom messages, while rust-lightning provides state
+	// tracking and transaction integration.
+
+	/// Propose extra outputs to be included in commitment transactions.
+	///
+	/// This queues the proposal in channel state. The caller is responsible for
+	/// sending a custom message to notify the counterparty about the proposal.
+	///
+	/// Returns `true` if the proposal is ready to be sent (channel can generate
+	/// new commitments), `false` if it was queued in the holding cell.
+	#[rustfmt::skip]
+	pub fn propose_extra_outputs(
+		&self,
+		counterparty_node_id: &PublicKey,
+		channel_id: &ChannelId,
+		outputs: Vec<CommitmentExtraOutput>,
+	) -> Result<bool, APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.entry(*channel_id) {
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					chan.propose_extra_outputs(outputs).map_err(|e| APIError::ChannelUnavailable {
+						err: format!("Failed to propose extra outputs: {:?}", e),
+					})
+				} else {
+					Err(APIError::APIMisuseError {
+						err: format!("Unfunded channel {} cannot have extra outputs", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Called when the counterparty proposes extra outputs via a custom message.
+	///
+	/// This stores the proposal in pending state. External code should emit an
+	/// event to validate the proposal and then call `accept_extra_outputs_proposal`
+	/// or `reject_extra_outputs_proposal`.
+	///
+	/// The `user_data` parameter allows external code to pass opaque validation
+	/// data (e.g., ledger hashes) that will be included in the validation event.
+	#[rustfmt::skip]
+	pub fn receive_extra_outputs_proposal(
+		&self,
+		counterparty_node_id: &PublicKey,
+		channel_id: &ChannelId,
+		outputs: Vec<CommitmentExtraOutput>,
+		user_data: Vec<u8>,
+	) -> Result<(), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.entry(*channel_id) {
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					chan.receive_extra_outputs_proposal(outputs, user_data).map_err(|e| APIError::ChannelUnavailable {
+						err: format!("Failed to receive extra outputs proposal: {:?}", e),
+					})
+				} else {
+					Err(APIError::APIMisuseError {
+						err: format!("Unfunded channel {} cannot have extra outputs", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Accept the counterparty's pending extra outputs proposal.
+	///
+	/// This confirms the pending proposal into channel state. The caller is
+	/// responsible for sending an acceptance message to the counterparty.
+	#[rustfmt::skip]
+	pub fn accept_extra_outputs_proposal(
+		&self,
+		counterparty_node_id: &PublicKey,
+		channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.entry(*channel_id) {
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					chan.accept_extra_outputs_proposal().map_err(|e| APIError::ChannelUnavailable {
+						err: format!("Failed to accept extra outputs proposal: {:?}", e),
+					})
+				} else {
+					Err(APIError::APIMisuseError {
+						err: format!("Unfunded channel {} cannot have extra outputs", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Reject the counterparty's pending extra outputs proposal.
+	///
+	/// This clears the pending proposal. The caller may send a rejection
+	/// message to the counterparty if the protocol requires it.
+	#[rustfmt::skip]
+	pub fn reject_extra_outputs_proposal(
+		&self,
+		counterparty_node_id: &PublicKey,
+		channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.entry(*channel_id) {
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					chan.reject_extra_outputs_proposal();
+					Ok(())
+				} else {
+					Err(APIError::APIMisuseError {
+						err: format!("Unfunded channel {} cannot have extra outputs", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Called when the counterparty accepts our extra outputs proposal.
+	///
+	/// This confirms our pending outbound proposal into channel state.
+	#[rustfmt::skip]
+	pub fn extra_outputs_accepted(
+		&self,
+		counterparty_node_id: &PublicKey,
+		channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.entry(*channel_id) {
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					chan.extra_outputs_accepted().map_err(|e| APIError::ChannelUnavailable {
+						err: format!("Failed to confirm extra outputs acceptance: {:?}", e),
+					})
+				} else {
+					Err(APIError::APIMisuseError {
+						err: format!("Unfunded channel {} cannot have extra outputs", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Query the current extra outputs for a channel.
+	///
+	/// Returns a tuple of (holder_extra_outputs, counterparty_extra_outputs).
+	#[rustfmt::skip]
+	pub fn get_channel_extra_outputs(
+		&self,
+		counterparty_node_id: &PublicKey,
+		channel_id: &ChannelId,
+	) -> Result<(Vec<CommitmentExtraOutput>, Vec<CommitmentExtraOutput>), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+			})?;
+		let peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.get(channel_id) {
+			Some(channel) => {
+				if let Some(chan) = channel.as_funded() {
+					Ok((
+						chan.holder_extra_outputs().to_vec(),
+						chan.counterparty_extra_outputs().to_vec(),
+					))
+				} else {
+					Err(APIError::APIMisuseError {
+						err: format!("Unfunded channel {} cannot have extra outputs", channel_id),
+					})
+				}
+			},
+			None => Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+	}
+
+	/// Clear all extra outputs from a channel.
+	///
+	/// This removes both holder and counterparty extra outputs, as well as any
+	/// pending proposals. The caller is responsible for coordinating this with
+	/// the counterparty via custom messages.
+	#[rustfmt::skip]
+	pub fn clear_channel_extra_outputs(
+		&self,
+		counterparty_node_id: &PublicKey,
+		channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {counterparty_node_id}")
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.entry(*channel_id) {
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					chan.clear_extra_outputs();
+					Ok(())
+				} else {
+					Err(APIError::APIMisuseError {
+						err: format!("Unfunded channel {} cannot have extra outputs", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
 	}
 
 	/// Utility for creating a BOLT11 invoice that can be verified by [`ChannelManager`] without

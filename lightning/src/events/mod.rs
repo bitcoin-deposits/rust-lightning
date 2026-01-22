@@ -23,6 +23,7 @@ use crate::blinded_path::payment::{
 	Bolt12OfferContext, Bolt12RefundContext, PaymentContext, PaymentContextRef,
 };
 use crate::chain::transaction;
+use crate::ln::chan_utils::CommitmentExtraOutput;
 use crate::ln::channel::FUNDING_CONF_DEADLINE_BLOCKS;
 use crate::ln::channelmanager::{InterceptId, PaymentId, RecipientOnionFields};
 use crate::ln::msgs;
@@ -1863,6 +1864,31 @@ pub enum Event {
 		/// [`ChannelManager::funding_transaction_signed`]: crate::ln::channelmanager::ChannelManager::funding_transaction_signed
 		unsigned_transaction: Transaction,
 	},
+	/// Counterparty has proposed extra outputs for commitment transactions.
+	///
+	/// This event is generated when the counterparty proposes extra outputs to be included
+	/// in commitment transactions via a custom message. External code should validate the
+	/// proposal and call either [`ChannelManager::accept_extra_outputs_proposal`] or
+	/// [`ChannelManager::reject_extra_outputs_proposal`].
+	///
+	/// This is used by extensions like Bitcoin Deposits reserves to include reserve outputs
+	/// in commitment transactions.
+	///
+	/// [`ChannelManager::accept_extra_outputs_proposal`]: crate::ln::channelmanager::ChannelManager::accept_extra_outputs_proposal
+	/// [`ChannelManager::reject_extra_outputs_proposal`]: crate::ln::channelmanager::ChannelManager::reject_extra_outputs_proposal
+	ExtraOutputsProposed {
+		/// The counterparty proposing the extra outputs.
+		counterparty_node_id: PublicKey,
+		/// The channel for which extra outputs are proposed.
+		channel_id: ChannelId,
+		/// The proposed extra outputs to include in commitment transactions.
+		outputs: Vec<CommitmentExtraOutput>,
+		/// Opaque data provided by the counterparty for validation purposes.
+		///
+		/// For Bitcoin Deposits reserves, this contains ledger hashes that can be used
+		/// to validate the proposal against local ledger state.
+		user_data: Vec<u8>,
+	},
 }
 
 impl Writeable for Event {
@@ -2346,6 +2372,20 @@ impl Writeable for Event {
 					(9, abandoned_funding_txo, option),
 					(11, *contributed_inputs, optional_vec),
 					(13, *contributed_outputs, optional_vec),
+				});
+			},
+			&Event::ExtraOutputsProposed {
+				ref counterparty_node_id,
+				ref channel_id,
+				ref outputs,
+				ref user_data,
+			} => {
+				53u8.write(writer)?;
+				write_tlv_fields!(writer, {
+					(1, counterparty_node_id, required),
+					(3, channel_id, required),
+					(5, *outputs, required_vec),
+					(7, *user_data, required_vec),
 				});
 			},
 			// Note that, going forward, all new events must only write data inside of
@@ -2975,6 +3015,24 @@ impl MaybeReadable for Event {
 						channel_type,
 						contributed_inputs: contributed_inputs.unwrap_or_default(),
 						contributed_outputs: contributed_outputs.unwrap_or_default(),
+					}))
+				};
+				f()
+			},
+			53u8 => {
+				let mut f = || {
+					_init_and_read_len_prefixed_tlv_fields!(reader, {
+						(1, counterparty_node_id, required),
+						(3, channel_id, required),
+						(5, outputs, required_vec),
+						(7, user_data, required_vec),
+					});
+
+					Ok(Some(Event::ExtraOutputsProposed {
+						counterparty_node_id: counterparty_node_id.0.unwrap(),
+						channel_id: channel_id.0.unwrap(),
+						outputs,
+						user_data,
 					}))
 				};
 				f()

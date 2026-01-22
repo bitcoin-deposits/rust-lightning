@@ -1597,6 +1597,45 @@ impl<'a> TrustedClosingTransaction<'a> {
 	}
 }
 
+/// An extra output to include in commitment transactions.
+///
+/// This is a generic mechanism for adding outputs to commitment transactions beyond the standard
+/// to_local, to_remote, anchor, and HTLC outputs. Used by extensions like Bitcoin Deposits
+/// for reserves outputs.
+///
+/// The output amount is subtracted from the proposer's channel balance. Both parties must agree
+/// on the extra outputs for commitment transaction signatures to be valid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitmentExtraOutput {
+	/// Output amount in satoshis
+	pub amount_satoshis: u64,
+	/// Output script (e.g., P2TR for Taproot outputs)
+	pub script_pubkey: ScriptBuf,
+}
+
+impl Writeable for CommitmentExtraOutput {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		write_tlv_fields!(writer, {
+			(0, self.amount_satoshis, required),
+			(2, self.script_pubkey, required),
+		});
+		Ok(())
+	}
+}
+
+impl Readable for CommitmentExtraOutput {
+	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		_init_and_read_len_prefixed_tlv_fields!(reader, {
+			(0, amount_satoshis, required),
+			(2, script_pubkey, required),
+		});
+		Ok(CommitmentExtraOutput {
+			amount_satoshis: amount_satoshis.0.unwrap(),
+			script_pubkey: script_pubkey.0.unwrap(),
+		})
+	}
+}
+
 /// This class tracks the per-transaction information needed to build a commitment transaction and will
 /// actually build it and sign.  It is used for holder transactions that we sign only when needed
 /// and for transactions we sign for the counterparty.
@@ -1619,6 +1658,10 @@ pub struct CommitmentTransaction {
 	keys: TxCreationKeys,
 	// For access to the pre-built transaction, see doc for trust()
 	built: BuiltCommitmentTransaction,
+	// Extra outputs for the broadcaster (holder when local, counterparty when remote)
+	broadcaster_extra_outputs: Vec<CommitmentExtraOutput>,
+	// Extra outputs for the countersignatory
+	countersignatory_extra_outputs: Vec<CommitmentExtraOutput>,
 }
 
 impl Eq for CommitmentTransaction {}
@@ -1631,7 +1674,9 @@ impl PartialEq for CommitmentTransaction {
 			self.feerate_per_kw == o.feerate_per_kw &&
 			self.nondust_htlcs == o.nondust_htlcs &&
 			self.channel_type_features == o.channel_type_features &&
-			self.keys == o.keys;
+			self.keys == o.keys &&
+			self.broadcaster_extra_outputs == o.broadcaster_extra_outputs &&
+			self.countersignatory_extra_outputs == o.countersignatory_extra_outputs;
 		if eq {
 			debug_assert_eq!(self.built.transaction, o.built.transaction);
 			debug_assert_eq!(self.built.txid, o.built.txid);
@@ -1655,6 +1700,8 @@ impl Writeable for CommitmentTransaction {
 			(12, self.nondust_htlcs, required_vec),
 			(14, legacy_deserialization_prevention_marker, option),
 			(15, self.channel_type_features, required),
+			(16, self.broadcaster_extra_outputs, optional_vec),
+			(17, self.countersignatory_extra_outputs, optional_vec),
 		});
 		Ok(())
 	}
@@ -1674,6 +1721,8 @@ impl Readable for CommitmentTransaction {
 			(12, nondust_htlcs, required_vec),
 			(14, _legacy_deserialization_prevention_marker, (option, explicit_type: ())),
 			(15, channel_type_features, option),
+			(16, broadcaster_extra_outputs, optional_vec),
+			(17, countersignatory_extra_outputs, optional_vec),
 		});
 
 		let mut additional_features = ChannelTypeFeatures::empty();
@@ -1689,7 +1738,9 @@ impl Readable for CommitmentTransaction {
 			keys: keys.0.unwrap(),
 			built: built.0.unwrap(),
 			nondust_htlcs,
-			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key())
+			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key()),
+			broadcaster_extra_outputs: broadcaster_extra_outputs.unwrap_or(Vec::new()),
+			countersignatory_extra_outputs: countersignatory_extra_outputs.unwrap_or(Vec::new()),
 		})
 	}
 }
@@ -1701,15 +1752,57 @@ impl CommitmentTransaction {
 	/// The broadcaster and countersignatory amounts MUST be either 0 or above dust. If the amount
 	/// is 0, the corresponding output will be omitted from the transaction.
 	#[rustfmt::skip]
-	pub fn new(commitment_number: u64, per_commitment_point: &PublicKey, to_broadcaster_value_sat: u64, to_countersignatory_value_sat: u64, feerate_per_kw: u32, mut nondust_htlcs: Vec<HTLCOutputInCommitment>, channel_parameters: &DirectedChannelTransactionParameters, secp_ctx: &Secp256k1<secp256k1::All>) -> CommitmentTransaction {
+	pub fn new(commitment_number: u64, per_commitment_point: &PublicKey, to_broadcaster_value_sat: u64, to_countersignatory_value_sat: u64, feerate_per_kw: u32, nondust_htlcs: Vec<HTLCOutputInCommitment>, channel_parameters: &DirectedChannelTransactionParameters, secp_ctx: &Secp256k1<secp256k1::All>) -> CommitmentTransaction {
+		Self::new_with_extra_outputs(
+			commitment_number,
+			per_commitment_point,
+			to_broadcaster_value_sat,
+			to_countersignatory_value_sat,
+			feerate_per_kw,
+			nondust_htlcs,
+			channel_parameters,
+			secp_ctx,
+			Vec::new(),
+			Vec::new(),
+		)
+	}
+
+	/// Constructs a new `CommitmentTransaction` with extra outputs.
+	///
+	/// Similar to `new()` but also includes extra outputs for each party. These outputs are
+	/// typically used by protocol extensions like Bitcoin Deposits for reserves outputs.
+	///
+	/// The extra output amounts are subtracted from the respective party's balance. Both parties
+	/// must agree on the extra outputs for commitment transaction signatures to be valid.
+	#[rustfmt::skip]
+	pub fn new_with_extra_outputs(
+		commitment_number: u64,
+		per_commitment_point: &PublicKey,
+		to_broadcaster_value_sat: u64,
+		to_countersignatory_value_sat: u64,
+		feerate_per_kw: u32,
+		mut nondust_htlcs: Vec<HTLCOutputInCommitment>,
+		channel_parameters: &DirectedChannelTransactionParameters,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+		broadcaster_extra_outputs: Vec<CommitmentExtraOutput>,
+		countersignatory_extra_outputs: Vec<CommitmentExtraOutput>,
+	) -> CommitmentTransaction {
 		let to_broadcaster_value_sat = Amount::from_sat(to_broadcaster_value_sat);
 		let to_countersignatory_value_sat = Amount::from_sat(to_countersignatory_value_sat);
 		let keys = TxCreationKeys::from_channel_static_keys(per_commitment_point, channel_parameters.broadcaster_pubkeys(), channel_parameters.countersignatory_pubkeys(), secp_ctx);
 
-		// Build and sort the outputs of the transaction.
+		// Build and sort the outputs of the transaction, including extra outputs.
 		// Also sort the HTLC output data in `nondust_htlcs` in the same order, and populate the
 		// transaction output indices therein.
-		let outputs = Self::build_outputs_and_htlcs(&keys, to_broadcaster_value_sat, to_countersignatory_value_sat, &mut nondust_htlcs, channel_parameters);
+		let outputs = Self::build_outputs_and_htlcs_with_extra(
+			&keys,
+			to_broadcaster_value_sat,
+			to_countersignatory_value_sat,
+			&mut nondust_htlcs,
+			channel_parameters,
+			&broadcaster_extra_outputs,
+			&countersignatory_extra_outputs,
+		);
 
 		let (obscured_commitment_transaction_number, txins) = Self::build_inputs(commitment_number, channel_parameters);
 		let transaction = Self::make_transaction(obscured_commitment_transaction_number, txins, outputs, channel_parameters);
@@ -1727,6 +1820,8 @@ impl CommitmentTransaction {
 				transaction,
 				txid
 			},
+			broadcaster_extra_outputs,
+			countersignatory_extra_outputs,
 		}
 	}
 
@@ -1774,8 +1869,8 @@ impl CommitmentTransaction {
 			return Err(())
 		}
 
-		// Then insert the max-4 non-htlc outputs, ordered by value, then by script pubkey
-		let insert_non_htlc_output = |non_htlc_output: TxOut| {
+		// Then insert the non-htlc outputs, ordered by value, then by script pubkey
+		let mut insert_non_htlc_output = |non_htlc_output: TxOut| {
 			let idx = match outputs.binary_search_by(|output| output.value.cmp(&non_htlc_output.value).then(output.script_pubkey.cmp(&non_htlc_output.script_pubkey))) {
 				// For non-HTLC outputs, if they're copying our SPK we don't really care if we
 				// close the channel due to mismatches - they're doing something dumb
@@ -1791,8 +1886,26 @@ impl CommitmentTransaction {
 			self.to_countersignatory_value_sat,
 			channel_parameters,
 			nondust_htlcs_value_sum_sat,
-			insert_non_htlc_output
+			&mut insert_non_htlc_output
 		);
+
+		// Insert extra outputs
+		for extra in &self.broadcaster_extra_outputs {
+			if extra.amount_satoshis > 0 {
+				insert_non_htlc_output(TxOut {
+					script_pubkey: extra.script_pubkey.clone(),
+					value: Amount::from_sat(extra.amount_satoshis),
+				});
+			}
+		}
+		for extra in &self.countersignatory_extra_outputs {
+			if extra.amount_satoshis > 0 {
+				insert_non_htlc_output(TxOut {
+					script_pubkey: extra.script_pubkey.clone(),
+					value: Amount::from_sat(extra.amount_satoshis),
+				});
+			}
+		}
 
 		let transaction = Self::make_transaction(obscured_commitment_transaction_number, txins, outputs, channel_parameters);
 		let txid = transaction.compute_txid();
@@ -1870,6 +1983,82 @@ impl CommitmentTransaction {
 			nondust_htlcs_value_sum_sat,
 			insert_non_htlc_output
 		);
+
+		outputs
+	}
+
+	/// Builds outputs including extra outputs for both parties.
+	#[rustfmt::skip]
+	fn build_outputs_and_htlcs_with_extra(
+		keys: &TxCreationKeys,
+		to_broadcaster_value_sat: Amount,
+		to_countersignatory_value_sat: Amount,
+		nondust_htlcs: &mut Vec<HTLCOutputInCommitment>,
+		channel_parameters: &DirectedChannelTransactionParameters,
+		broadcaster_extra_outputs: &[CommitmentExtraOutput],
+		countersignatory_extra_outputs: &[CommitmentExtraOutput],
+	) -> Vec<TxOut> {
+		// First build and sort the HTLC outputs.
+		// Also sort the HTLC output data in `nondust_htlcs` in the same order.
+		let mut outputs = Self::build_sorted_htlc_outputs(keys, nondust_htlcs, channel_parameters.channel_type_features());
+
+		let nondust_htlcs_value_sum_sat = nondust_htlcs.iter().map(|htlc| htlc.to_bitcoin_amount()).sum();
+
+		// Initialize the transaction output indices; we will update them below when we
+		// add the non-htlc transaction outputs.
+		nondust_htlcs
+			.iter_mut()
+			.enumerate()
+			.for_each(|(i, htlc)| htlc.transaction_output_index = Some(i as u32));
+
+		// Helper to insert a non-HTLC output in sorted order and update HTLC indices
+		let mut insert_non_htlc_output = |non_htlc_output: TxOut| {
+			let idx = match outputs.binary_search_by(|output| output.value.cmp(&non_htlc_output.value).then(output.script_pubkey.cmp(&non_htlc_output.script_pubkey))) {
+				Ok(i) => i,
+				Err(i) => i,
+			};
+			outputs.insert(idx, non_htlc_output);
+
+			// Increment the transaction output indices of all the HTLCs that come after
+			nondust_htlcs
+				.iter_mut()
+				.rev()
+				.map_while(|htlc| {
+					let i = htlc.transaction_output_index.as_mut().unwrap();
+					(*i >= idx as u32).then(|| i)
+				})
+				.for_each(|i| *i += 1);
+		};
+
+		// Insert standard non-HTLC outputs (to_local, to_remote, anchors)
+		Self::insert_non_htlc_outputs(
+			keys,
+			to_broadcaster_value_sat,
+			to_countersignatory_value_sat,
+			channel_parameters,
+			nondust_htlcs_value_sum_sat,
+			&mut insert_non_htlc_output
+		);
+
+		// Insert broadcaster's extra outputs
+		for extra in broadcaster_extra_outputs {
+			if extra.amount_satoshis > 0 {
+				insert_non_htlc_output(TxOut {
+					script_pubkey: extra.script_pubkey.clone(),
+					value: Amount::from_sat(extra.amount_satoshis),
+				});
+			}
+		}
+
+		// Insert countersignatory's extra outputs
+		for extra in countersignatory_extra_outputs {
+			if extra.amount_satoshis > 0 {
+				insert_non_htlc_output(TxOut {
+					script_pubkey: extra.script_pubkey.clone(),
+					value: Amount::from_sat(extra.amount_satoshis),
+				});
+			}
+		}
 
 		outputs
 	}
@@ -2060,6 +2249,16 @@ impl CommitmentTransaction {
 	/// expose a less effecient version which creates a Vec of references in the future.
 	pub fn nondust_htlcs(&self) -> &Vec<HTLCOutputInCommitment> {
 		&self.nondust_htlcs
+	}
+
+	/// Get the broadcaster's extra outputs included in this commitment transaction.
+	pub fn broadcaster_extra_outputs(&self) -> &Vec<CommitmentExtraOutput> {
+		&self.broadcaster_extra_outputs
+	}
+
+	/// Get the countersignatory's extra outputs included in this commitment transaction.
+	pub fn countersignatory_extra_outputs(&self) -> &Vec<CommitmentExtraOutput> {
+		&self.countersignatory_extra_outputs
 	}
 
 	/// Trust our pre-built transaction and derived transaction creation public keys.

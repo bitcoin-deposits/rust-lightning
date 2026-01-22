@@ -2890,6 +2890,19 @@ where
 
 	latest_monitor_update_id: u64,
 
+	// Extra outputs for commitment transactions (generic extension mechanism)
+	// Holder's extra outputs (subtracted from holder's balance)
+	holder_extra_outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+	// Counterparty's extra outputs (subtracted from counterparty's balance)
+	counterparty_extra_outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+	// Pending inbound proposal: counterparty proposed these, awaiting our accept/reject
+	// Tuple: (outputs, opaque user_data for application-level validation)
+	pending_inbound_extra_outputs: Option<(Vec<crate::ln::chan_utils::CommitmentExtraOutput>, Vec<u8>)>,
+	// Pending outbound proposal: we proposed these, awaiting counterparty acceptance
+	pending_outbound_extra_outputs: Option<Vec<crate::ln::chan_utils::CommitmentExtraOutput>>,
+	// Queued proposal waiting for channel to be ready (like holding_cell_htlc_updates)
+	holding_cell_extra_outputs: Option<Vec<crate::ln::chan_utils::CommitmentExtraOutput>>,
+
 	holder_signer: ChannelSignerType<SP>,
 	shutdown_scriptpubkey: Option<ShutdownScript>,
 	destination_script: ScriptBuf,
@@ -3625,6 +3638,12 @@ where
 
 			latest_monitor_update_id: 0,
 
+			holder_extra_outputs: Vec::new(),
+			counterparty_extra_outputs: Vec::new(),
+			pending_inbound_extra_outputs: None,
+			pending_outbound_extra_outputs: None,
+			holding_cell_extra_outputs: None,
+
 			holder_signer: ChannelSignerType::Ecdsa(holder_signer),
 			shutdown_scriptpubkey,
 			destination_script,
@@ -3863,6 +3882,12 @@ where
 			secp_ctx,
 
 			latest_monitor_update_id: 0,
+
+			holder_extra_outputs: Vec::new(),
+			counterparty_extra_outputs: Vec::new(),
+			pending_inbound_extra_outputs: None,
+			pending_outbound_extra_outputs: None,
+			holding_cell_extra_outputs: None,
 
 			holder_signer: ChannelSignerType::Ecdsa(holder_signer),
 			shutdown_scriptpubkey,
@@ -5366,7 +5391,23 @@ where
 
 		let value_to_self_msat = (funding.value_to_self_msat + value_to_self_claimed_msat).checked_sub(value_to_remote_claimed_msat).unwrap();
 
-		let (tx, stats) = SpecTxBuilder {}.build_commitment_transaction(
+		// Get effective extra outputs for commitment tx building
+		// Use pending if exists, otherwise confirmed
+		let holder_extra = self.pending_outbound_extra_outputs.as_ref()
+			.unwrap_or(&self.holder_extra_outputs)
+			.clone();
+		let counterparty_extra = self.pending_inbound_extra_outputs.as_ref()
+			.map(|(outputs, _)| outputs.clone())
+			.unwrap_or_else(|| self.counterparty_extra_outputs.clone());
+
+		// Determine which outputs go to broadcaster vs countersignatory based on local flag
+		let (broadcaster_extra, countersignatory_extra) = if local {
+			(holder_extra, counterparty_extra)
+		} else {
+			(counterparty_extra, holder_extra)
+		};
+
+		let (tx, stats) = SpecTxBuilder {}.build_commitment_transaction_with_extra_outputs(
 			local,
 			commitment_number,
 			per_commitment_point,
@@ -5376,6 +5417,8 @@ where
 			htlcs_included.iter().map(|(htlc, _source)| htlc).cloned().collect(),
 			feerate_per_kw,
 			broadcaster_dust_limit_sat,
+			broadcaster_extra,
+			countersignatory_extra,
 			logger,
 		);
 		#[cfg(any(test, fuzzing))]
@@ -5690,7 +5733,28 @@ where
 			funding.get_channel_type(),
 		);
 
-		let outbound_capacity_msat = local_balance_before_fee_msat
+		// Account for extra outputs (commitment transaction extensions like reserves)
+		// Holder extra outputs reduce our available local balance
+		// Counterparty extra outputs reduce their available remote balance
+		// Use effective outputs (pending if exists, otherwise confirmed)
+		let holder_extra_total_msat: u64 = self.pending_outbound_extra_outputs.as_ref()
+			.unwrap_or(&self.holder_extra_outputs)
+			.iter()
+			.map(|o| o.amount_satoshis * 1000)
+			.sum();
+		let counterparty_extra_total_msat: u64 = self.pending_inbound_extra_outputs.as_ref()
+			.map(|(outputs, _)| outputs)
+			.unwrap_or(&self.counterparty_extra_outputs)
+			.iter()
+			.map(|o| o.amount_satoshis * 1000)
+			.sum();
+
+		let local_balance_after_extra_msat = local_balance_before_fee_msat
+			.saturating_sub(holder_extra_total_msat);
+		let remote_balance_after_extra_msat = remote_balance_before_fee_msat
+			.saturating_sub(counterparty_extra_total_msat);
+
+		let outbound_capacity_msat = local_balance_after_extra_msat
 				.saturating_sub(
 					funding.counterparty_selected_channel_reserve_satoshis.unwrap_or(0) * 1000);
 
@@ -5810,7 +5874,7 @@ where
 
 		#[allow(deprecated)] // TODO: Remove once balance_msat is removed.
 		AvailableBalances {
-			inbound_capacity_msat: remote_balance_before_fee_msat.saturating_sub(funding.holder_selected_channel_reserve_satoshis * 1000),
+			inbound_capacity_msat: remote_balance_after_extra_msat.saturating_sub(funding.holder_selected_channel_reserve_satoshis * 1000),
 			outbound_capacity_msat,
 			next_outbound_htlc_limit_msat: available_capacity_msat,
 			next_outbound_htlc_minimum_msat,
@@ -13540,6 +13604,149 @@ where
 		// CHANNEL_ANNOUNCEMENT_PROPAGATION_DELAY confirmations.
 		self.context.historical_scids.drain(0..end)
 	}
+
+	// ==================== Extra Outputs Methods ====================
+	// These methods manage extra outputs in commitment transactions.
+	// Extra outputs are a generic extension mechanism for adding outputs beyond
+	// the standard to_local, to_remote, anchor, and HTLC outputs.
+
+	/// Get the effective holder extra outputs (uses pending if exists, otherwise confirmed).
+	pub fn effective_holder_extra_outputs(&self) -> &[crate::ln::chan_utils::CommitmentExtraOutput] {
+		self.context.pending_outbound_extra_outputs.as_ref()
+			.map(|v| v.as_slice())
+			.unwrap_or(&self.context.holder_extra_outputs)
+	}
+
+	/// Get the effective counterparty extra outputs (uses pending if exists, otherwise confirmed).
+	pub fn effective_counterparty_extra_outputs(&self) -> &[crate::ln::chan_utils::CommitmentExtraOutput] {
+		self.context.pending_inbound_extra_outputs.as_ref()
+			.map(|(outputs, _)| outputs.as_slice())
+			.unwrap_or(&self.context.counterparty_extra_outputs)
+	}
+
+	/// Get the confirmed holder extra outputs.
+	pub fn holder_extra_outputs(&self) -> &[crate::ln::chan_utils::CommitmentExtraOutput] {
+		&self.context.holder_extra_outputs
+	}
+
+	/// Get the confirmed counterparty extra outputs.
+	pub fn counterparty_extra_outputs(&self) -> &[crate::ln::chan_utils::CommitmentExtraOutput] {
+		&self.context.counterparty_extra_outputs
+	}
+
+	/// Check if there's a pending inbound extra outputs proposal.
+	pub fn has_pending_inbound_extra_outputs(&self) -> bool {
+		self.context.pending_inbound_extra_outputs.is_some()
+	}
+
+	/// Check if there's a pending outbound extra outputs proposal.
+	pub fn has_pending_outbound_extra_outputs(&self) -> bool {
+		self.context.pending_outbound_extra_outputs.is_some()
+	}
+
+	/// Propose extra outputs for this channel.
+	///
+	/// Returns `Ok(true)` if the proposal is ready to be sent immediately.
+	/// Returns `Ok(false)` if the proposal was queued in the holding cell (channel busy).
+	///
+	/// External code should send a custom message to notify the counterparty after this returns.
+	pub fn propose_extra_outputs(
+		&mut self,
+		outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+	) -> Result<bool, ChannelError> {
+		// Check if we already have a pending proposal
+		if self.context.pending_outbound_extra_outputs.is_some() {
+			return Err(ChannelError::Warn(
+				"Already have pending outbound extra outputs proposal".to_owned()
+			));
+		}
+
+		// If channel can't generate new commitment, queue in holding cell
+		if !self.context.channel_state.can_generate_new_commitment() {
+			self.context.holding_cell_extra_outputs = Some(outputs);
+			return Ok(false); // Queued, not ready to send yet
+		}
+
+		self.context.pending_outbound_extra_outputs = Some(outputs);
+		Ok(true) // Ready to send
+	}
+
+	/// Called when counterparty proposes extra outputs via custom message.
+	///
+	/// Stores the proposal as pending; external code should validate and then call
+	/// `accept_extra_outputs_proposal` or `reject_extra_outputs_proposal`.
+	pub fn receive_extra_outputs_proposal(
+		&mut self,
+		outputs: Vec<crate::ln::chan_utils::CommitmentExtraOutput>,
+		user_data: Vec<u8>,
+	) -> Result<(), ChannelError> {
+		if self.context.pending_inbound_extra_outputs.is_some() {
+			return Err(ChannelError::Warn(
+				"Already have pending inbound extra outputs proposal".to_owned()
+			));
+		}
+		self.context.pending_inbound_extra_outputs = Some((outputs, user_data));
+		Ok(())
+	}
+
+	/// Accept the counterparty's extra outputs proposal.
+	///
+	/// Moves the pending inbound outputs to confirmed state.
+	/// External code should send an acceptance message to the counterparty after this.
+	pub fn accept_extra_outputs_proposal(&mut self) -> Result<(), ChannelError> {
+		let (outputs, _user_data) = self.context.pending_inbound_extra_outputs.take()
+			.ok_or_else(|| ChannelError::Warn(
+				"No pending inbound extra outputs proposal to accept".to_owned()
+			))?;
+		self.context.counterparty_extra_outputs = outputs;
+		Ok(())
+	}
+
+	/// Reject the counterparty's extra outputs proposal.
+	///
+	/// Clears the pending inbound proposal without applying it.
+	pub fn reject_extra_outputs_proposal(&mut self) {
+		self.context.pending_inbound_extra_outputs = None;
+	}
+
+	/// Called when counterparty accepts our extra outputs proposal.
+	///
+	/// Moves our pending outbound outputs to confirmed state.
+	pub fn extra_outputs_accepted(&mut self) -> Result<(), ChannelError> {
+		let outputs = self.context.pending_outbound_extra_outputs.take()
+			.ok_or_else(|| ChannelError::Warn(
+				"No pending outbound extra outputs proposal".to_owned()
+			))?;
+		self.context.holder_extra_outputs = outputs;
+		Ok(())
+	}
+
+	/// Process any queued extra outputs from the holding cell.
+	///
+	/// Returns `Some(outputs)` if there were queued outputs that are now ready to send.
+	pub fn maybe_process_holding_cell_extra_outputs(
+		&mut self,
+	) -> Option<Vec<crate::ln::chan_utils::CommitmentExtraOutput>> {
+		if !self.context.channel_state.can_generate_new_commitment() {
+			return None; // Still can't process
+		}
+
+		if let Some(outputs) = self.context.holding_cell_extra_outputs.take() {
+			self.context.pending_outbound_extra_outputs = Some(outputs.clone());
+			Some(outputs)
+		} else {
+			None
+		}
+	}
+
+	/// Clear all extra outputs state. Used when closing the channel.
+	pub fn clear_extra_outputs(&mut self) {
+		self.context.holder_extra_outputs.clear();
+		self.context.counterparty_extra_outputs.clear();
+		self.context.pending_inbound_extra_outputs = None;
+		self.context.pending_outbound_extra_outputs = None;
+		self.context.holding_cell_extra_outputs = None;
+	}
 }
 
 /// A not-yet-funded outbound (from holder) channel using V1 channel establishment.
@@ -15129,6 +15336,8 @@ where
 			(75, inbound_committed_update_adds, optional_vec),
 			(77, holding_cell_accountable_flags, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, self.context.holder_extra_outputs, optional_vec), // Extra outputs for commitment tx extensions
+			(83, self.context.counterparty_extra_outputs, optional_vec), // Extra outputs for commitment tx extensions
 		});
 
 		Ok(())
@@ -15521,6 +15730,8 @@ where
 		let mut inbound_committed_update_adds_opt: Option<Vec<Option<msgs::UpdateAddHTLC>>> = None;
 		let mut holding_cell_accountable: Option<Vec<bool>> = None;
 		let mut pending_outbound_accountable: Option<Vec<bool>> = None;
+		let mut holder_extra_outputs: Option<Vec<crate::ln::chan_utils::CommitmentExtraOutput>> = None;
+		let mut counterparty_extra_outputs: Option<Vec<crate::ln::chan_utils::CommitmentExtraOutput>> = None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -15573,6 +15784,8 @@ where
 			(75, inbound_committed_update_adds_opt, optional_vec),
 			(77, holding_cell_accountable, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, holder_extra_outputs, optional_vec), // Extra outputs for commitment tx extensions
+			(83, counterparty_extra_outputs, optional_vec), // Extra outputs for commitment tx extensions
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -15933,6 +16146,13 @@ where
 				secp_ctx,
 
 				latest_monitor_update_id,
+
+				// Extra outputs default to empty for channels serialized before this feature
+				holder_extra_outputs: holder_extra_outputs.unwrap_or_default(),
+				counterparty_extra_outputs: counterparty_extra_outputs.unwrap_or_default(),
+				pending_inbound_extra_outputs: None,
+				pending_outbound_extra_outputs: None,
+				holding_cell_extra_outputs: None,
 
 				holder_signer: ChannelSignerType::Ecdsa(holder_signer),
 				shutdown_scriptpubkey,
